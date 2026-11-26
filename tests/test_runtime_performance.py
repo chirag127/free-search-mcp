@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import sqlite3
 import threading
 import time
+import weakref
 
+import aiosqlite
 import anyio
 import pytest
 
@@ -110,6 +114,416 @@ async def test_no_reclaimable_pages_means_no_repeated_vacuum(cache, monkeypatch)
     await instance._maintain(conn)
     await instance._maintain(conn)
     assert "VACUUM" not in statements
+
+
+async def test_background_cache_sql_does_not_block_foreground_reads(cache, monkeypatch):
+    instance, foreground = cache
+    await instance.put_page("https://example.test/newest", "Newest", "retained content")
+    entered = threading.Event()
+    release = threading.Event()
+    connections = []
+
+    def pause():
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("test did not release maintenance")
+        return 1
+
+    async def maintenance(conn):
+        connections.append(conn)
+        await conn.create_function("maintenance_pause", 0, pause)
+        await conn.execute_fetchall("SELECT maintenance_pause()")
+
+    monkeypatch.setattr(instance, "_maintain", maintenance)
+    instance._spawn_maintenance()
+    task = instance._maintain_task
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert connections == [connections[0]] and connections[0] is not foreground
+        page = await asyncio.wait_for(instance.get_page("https://example.test/newest"), 2)
+        assert page["content"] == "retained content"
+        instance._spawn_maintenance()
+        assert instance._maintain_task is task
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 5)
+    with pytest.raises(ValueError, match="no active connection"):
+        await connections[0].execute("SELECT 1")
+
+
+@pytest.mark.parametrize("write_kind", ["page", "search"])
+async def test_maintenance_writer_wait_does_not_timeout_or_block_reads(cache, monkeypatch, write_kind):
+    instance, foreground = cache
+    url = "https://example.test/retained"
+    await instance.put_page(url, "Title", "retained content")
+    async with foreground.execute("PRAGMA busy_timeout=20"):
+        pass
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def maintenance(conn):
+        async with conn.execute("UPDATE pages SET title=title WHERE url=?", (url,)):
+            pass
+        entered.set()
+        await release.wait()
+        await conn.commit()
+
+    async def write():
+        if write_kind == "page":
+            await instance.put_page("https://example.test/written", "Title", "new")
+        else:
+            await instance.put_search("written", "q", ["fake"], [{"url": url}])
+
+    monkeypatch.setattr(instance, "_maintain", maintenance)
+    instance._spawn_maintenance()
+    writing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        writing = asyncio.create_task(write())
+        done, _ = await asyncio.wait({writing}, timeout=0.1)
+        assert not done, "local maintenance exhausted the foreground busy timeout"
+        page = await asyncio.wait_for(instance.get_page(url), 1)
+        assert page["content"] == "retained content"
+        release.set()
+        await asyncio.wait_for(writing, 5)
+        assert not foreground.in_transaction
+    finally:
+        release.set()
+        if writing is not None:
+            await asyncio.gather(writing, return_exceptions=True)
+        await asyncio.wait_for(instance._maintain_task, 5)
+
+
+@pytest.mark.parametrize("direct_connection", [False, True])
+def test_closed_cache_does_not_retain_retired_event_loops(tmp_path, monkeypatch, direct_connection):
+    monkeypatch.setattr(settings, "cache_dir", tmp_path)
+    instance = Cache()
+    loops = []
+
+    async def use_and_close():
+        loops.append(weakref.ref(asyncio.get_running_loop()))
+        try:
+            if direct_connection:
+                await asyncio.gather(*(instance._conn() for _ in range(4)))
+            await asyncio.gather(*(
+                instance.put_page(f"https://example.test/{index}", "Title", "content")
+                for index in range(4)
+            ))
+            assert (await instance.get_page("https://example.test/3"))["content"] == "content"
+        finally:
+            await instance.close()
+
+    for _ in range(3):
+        asyncio.run(use_and_close())
+    gc.collect()
+    assert all(loop() is None for loop in loops)
+
+
+@pytest.mark.parametrize("close_cache", [False, True], ids=["cancel-writer", "close-cache"])
+async def test_maintenance_waiting_writer_cancellation_releases_ownership(cache, monkeypatch, close_cache):
+    instance, foreground = cache
+    url = "https://example.test/retained"
+    await instance.put_page(url, "Title", "retained content")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def maintenance(conn):
+        async with conn.execute("UPDATE pages SET title=title WHERE url=?", (url,)):
+            pass
+        entered.set()
+        await release.wait()
+        await conn.commit()
+
+    monkeypatch.setattr(instance, "_maintain", maintenance)
+    instance._spawn_maintenance()
+    task = instance._maintain_task
+    writing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        writing = asyncio.create_task(instance.put_page("https://example.test/new", "Title", "new"))
+        done, _ = await asyncio.wait({writing}, timeout=0.05)
+        assert not done
+        if close_cache:
+            # Shutdown must cancel maintenance even with a foreground writer waiting.
+            await asyncio.wait_for(instance.close(), 1)
+            release.set()
+            await asyncio.wait_for(writing, 5)
+            assert task.cancelled()
+        else:
+            writing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(writing, 1)
+            assert not task.done(), "cancelling a waiting writer cancelled maintenance"
+            page = await asyncio.wait_for(instance.get_page(url), 1)
+            assert page["content"] == "retained content"
+            release.set()
+            await asyncio.wait_for(task, 5)
+            assert await instance.get_page("https://example.test/new") is None
+            assert not foreground.in_transaction
+        await instance.put_page("https://example.test/later", "Title", "later")
+        assert (await instance.get_page("https://example.test/later"))["content"] == "later"
+    finally:
+        release.set()
+        if writing is not None:
+            await asyncio.gather(writing, return_exceptions=True)
+        await instance.close()
+
+
+async def test_background_maintenance_defers_checkpoint_for_a_held_reader(cache, caplog):
+    instance, foreground = cache
+    now = int(time.time())
+    async with foreground.executemany(
+        "INSERT INTO pages(url, content, fetched) VALUES (?, ?, ?)",
+        [(f"https://example.test/{i}", "x" * 50_000, now - 30 + i) for i in range(30)],
+    ):
+        pass
+    await foreground.commit()
+    caplog.set_level("INFO", logger="search_mcp.cache")
+
+    async with foreground.execute("SELECT url FROM pages ORDER BY fetched") as reader:
+        assert await reader.fetchone() == ("https://example.test/0",)
+        instance._spawn_maintenance()
+        await asyncio.wait_for(instance._maintain_task, 5)
+        assert "cache maintenance failed" not in caplog.text
+        assert "cache maintenance connection failed" not in caplog.text
+        assert "cache checkpoint deferred" in caplog.text
+        assert len(await reader.fetchall()) == 29
+
+    instance._spawn_maintenance()
+    await asyncio.wait_for(instance._maintain_task, 5)
+    assert instance._db_size() <= 1024 * 1024
+    assert await instance.get_page("https://example.test/29") is not None
+    assert "cache maintenance failed" not in caplog.text
+
+
+@pytest.mark.parametrize("write_kind", ["page", "search"])
+async def test_public_read_and_maintenance_do_not_poison_later_writes(
+    tmp_path, monkeypatch, write_kind,
+):
+    monkeypatch.setattr(settings, "cache_dir", tmp_path)
+    monkeypatch.setattr(settings, "cache_max_mb", 0)
+    monkeypatch.setattr(settings, "cache_ttl_seconds", 60)
+    entered, release, armed = threading.Event(), threading.Event(), threading.Event()
+    real_connect = aiosqlite.connect
+
+    class SnapshotConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=(), /):
+            cursor = super().execute(sql, parameters)
+            if armed.is_set() and sql.startswith("SELECT url FROM pages WHERE url LIKE"):
+                armed.clear()
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test did not release the foreground read")
+            return cursor
+
+    def connect(*args, **kwargs):
+        return real_connect(*args, factory=SnapshotConnection, **kwargs)
+
+    monkeypatch.setattr(aiosqlite, "connect", connect)
+    instance = Cache()
+    tasks = []
+    try:
+        foreground = await instance._conn()
+        await instance._maintain_task
+        for index in range(2):
+            await instance.put_page(f"https://example.test/{index}", "Title", "fresh")
+        async with foreground.execute(
+            "INSERT INTO pages(url, content, fetched) VALUES (?, ?, ?)",
+            ("https://example.test/expired", "old", int(time.time()) - 1000),
+        ):
+            pass
+        await foreground.commit()
+        armed.set()
+        reading = asyncio.create_task(instance.complete_page_urls("example.test/"))
+        tasks.append(reading)
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        # Advance WAL while the public read owns an unfinished snapshot.
+        instance._spawn_maintenance()
+        await asyncio.wait_for(instance._maintain_task, 5)
+        write_started = asyncio.Event()
+
+        async def write():
+            write_started.set()
+            if write_kind == "page":
+                await instance.put_page("https://example.test/written", "Title", "new")
+            else:
+                await instance.put_search("written", "q", ["fake"], [{"url": "https://example.test/"}])
+
+        writing = asyncio.create_task(write())
+        tasks.append(writing)
+        await write_started.wait()
+        release.set()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        assert isinstance(outcomes[0], list), outcomes
+        assert outcomes[1] is None, outcomes
+        assert not foreground.in_transaction
+        await instance.put_page("https://example.test/later", "Title", "later")
+        await instance.put_search("later", "q", ["fake"], [{"url": "https://example.test/later"}])
+        assert await instance.get_page("https://example.test/later") is not None
+        assert await instance.get_search("later") is not None
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await instance.close()
+
+
+@pytest.mark.parametrize("cancellations", [0, 1, 3])
+async def test_close_drains_foreground_read_before_propagating_cancellation(
+    tmp_path, monkeypatch, cancellations,
+):
+    monkeypatch.setattr(settings, "cache_dir", tmp_path)
+    entered, release, armed = threading.Event(), threading.Event(), threading.Event()
+    real_connect = aiosqlite.connect
+
+    class GatedConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=(), /):
+            cursor = super().execute(sql, parameters)
+            if armed.is_set() and sql.startswith("SELECT title, content, fetched FROM pages"):
+                armed.clear()
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test did not release the foreground read")
+            return cursor
+
+    def connect(*args, **kwargs):
+        return real_connect(*args, factory=GatedConnection, **kwargs)
+
+    monkeypatch.setattr(aiosqlite, "connect", connect)
+    instance = Cache()
+    tasks = []
+    url = "https://example.test/retained"
+    try:
+        await instance.put_page(url, "Title", "retained content")
+        await asyncio.wait_for(instance._maintain_task, 5)
+        foreground = instance._conn_obj
+        armed.set()
+        reading = asyncio.create_task(instance.get_page(url))
+        tasks.append(reading)
+        assert await asyncio.to_thread(entered.wait, 5)
+        closing = asyncio.create_task(instance.close())
+        tasks.append(closing)
+        done, _ = await asyncio.wait({closing}, timeout=0.05)
+        assert not done, "close returned before the foreground read completed"
+        for _ in range(cancellations):
+            closing.cancel()
+            done, _ = await asyncio.wait({closing}, timeout=0.05)
+            assert not done, "cancelled close abandoned the foreground read"
+
+        release.set()
+        page = await asyncio.wait_for(reading, 5)
+        assert page["url"] == url and page["content"] == "retained content"
+        if cancellations:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 5)
+        else:
+            await asyncio.wait_for(closing, 5)
+        assert instance._conn_obj is None
+        assert instance._maintain_task is None
+        with pytest.raises(ValueError, match="no active connection"):
+            await foreground.execute("SELECT 1")
+        worker = getattr(foreground, "_thread", None)
+        if worker is not None:
+            await asyncio.to_thread(worker.join, 5)
+            assert not worker.is_alive()
+
+        assert (await asyncio.wait_for(instance.get_page(url), 5))["content"] == "retained content"
+        await asyncio.wait_for(instance.put_page(url, "Updated", "reopened content"), 5)
+        assert (await asyncio.wait_for(instance.get_page(url), 5))["content"] == "reopened content"
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
+        await asyncio.wait_for(instance.close(), 5)
+
+
+async def test_close_interrupts_and_closes_running_cache_maintenance(cache, monkeypatch):
+    instance, foreground = cache
+    entered = threading.Event()
+    connections = []
+
+    async def maintenance(conn):
+        connections.append(conn)
+        deadline = time.monotonic() + 10
+        # Bound even a failed interrupt so the regression cannot leave a busy worker.
+        await conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        await conn.set_trace_callback(lambda sql: entered.set())
+        await conn.execute_fetchall(
+            "WITH RECURSIVE counter(x) AS (VALUES(0) UNION ALL "
+            "SELECT x + 1 FROM counter) SELECT sum(x) FROM counter"
+        )
+
+    monkeypatch.setattr(instance, "_maintain", maintenance)
+    instance._spawn_maintenance()
+    task = instance._maintain_task
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert connections[0] is not foreground
+        await asyncio.wait_for(instance.close(), 5)
+        assert task.cancelled()
+        assert instance._maintain_task is None
+        assert instance._conn_obj is None
+        with pytest.raises(ValueError, match="no active connection"):
+            await connections[0].execute("SELECT 1")
+    finally:
+        if not task.done():
+            await connections[0].interrupt()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await instance.close()
+
+
+@pytest.mark.parametrize("cancel_close", [False, True])
+async def test_close_drains_maintenance_connection_acquisition(cache, monkeypatch, cancel_close):
+    instance, _ = cache
+    entered = threading.Event()
+    release = threading.Event()
+    connections = []
+    real_connect = aiosqlite.connect
+
+    class DelayedConnection(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release connection acquisition")
+
+    def connect(*args, **kwargs):
+        connection = real_connect(*args, factory=DelayedConnection, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(aiosqlite, "connect", connect)
+    instance._spawn_maintenance()
+    task = instance._maintain_task
+    closing = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        closing = asyncio.create_task(instance.close())
+        done, _ = await asyncio.wait({closing}, timeout=0.05)
+        assert not done, "close returned while its connection worker was still opening"
+        if cancel_close:
+            closing.cancel()
+            done, _ = await asyncio.wait({closing}, timeout=0.05)
+            assert not done, "cancelled close abandoned connection acquisition"
+        release.set()
+        if cancel_close:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 5)
+        else:
+            await asyncio.wait_for(closing, 5)
+        assert task.cancelled()
+        assert instance._maintain_task is None
+        assert instance._conn_obj is None
+        with pytest.raises(ValueError, match="no active connection"):
+            await connections[0].execute("SELECT 1")
+    finally:
+        release.set()
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
+        await instance.close()
+        for connection in connections:
+            await connection.close()
+            worker = getattr(connection, "_thread", None)
+            if worker is not None and worker.ident is not None:
+                await asyncio.to_thread(worker.join, 5)
 
 
 @pytest.mark.parametrize("stage", ["start", "script"])

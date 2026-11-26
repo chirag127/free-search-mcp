@@ -216,14 +216,17 @@ def test_read_ttl(freshness, category, max_age, expected):
 
 
 @pytest.fixture
-def isolated_cache(tmp_path, monkeypatch):
+async def isolated_cache(tmp_path, monkeypatch):
     from search_mcp import cache as cache_mod
 
     fresh = cache_mod.Cache()
     fresh._path = str(tmp_path / "merge_identity.sqlite")
     monkeypatch.setattr(cache_mod, "cache", fresh)
     monkeypatch.setattr(aggregator, "cache", fresh)
-    return fresh
+    try:
+        yield fresh
+    finally:
+        await fresh.close()
 
 
 class _Engine:

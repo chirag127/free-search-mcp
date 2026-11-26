@@ -7,6 +7,7 @@ constructing a fresh Cache() and pointing its _path at tmp_path.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 import aiosqlite
 import pytest
@@ -15,7 +16,7 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-def fresh_cache(tmp_path, monkeypatch):
+async def fresh_cache(tmp_path, monkeypatch):
     """A brand-new Cache pointed at an isolated tmp sqlite file.
 
     Also redirect settings.cache_dir so settings.cache_path() (used by the
@@ -27,7 +28,10 @@ def fresh_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "cache_dir", tmp_path)
     c = cache_mod.Cache()
     c._path = str(tmp_path / "test_cache.sqlite")
-    return c
+    try:
+        yield c
+    finally:
+        await c.close()
 
 
 # --- #15: single long-lived connection, WAL, busy_timeout, race-free init ---
@@ -222,6 +226,111 @@ async def test_maintain_enforces_size_cap_dropping_oldest(fresh_cache, monkeypat
     await fresh_cache.close()
 
 
+@pytest.mark.parametrize("expire_old", [False, True], ids=["eviction", "ttl-purge"])
+async def test_maintain_reclaims_fts_history_before_evicting_more_pages(
+    fresh_cache, monkeypatch, expire_old,
+):
+    from search_mcp.config import settings
+
+    monkeypatch.setattr(settings, "cache_max_mb", 0)
+    monkeypatch.setattr(settings, "cache_ttl_seconds", 10**9)
+    conn = await fresh_cache._conn()
+    await fresh_cache._maintain_task
+    now = int(__import__("time").time())
+    try:
+        # Repeated-character bodies hardly exercise FTS storage; distinct words do.
+        rows = [
+            (
+                f"https://example.com/{page}", f"Document {page}",
+                "cachemarker " + " ".join(
+                    hashlib.sha256(f"{page}:{word}".encode()).hexdigest()[:16]
+                    for word in range(3000)
+                ),
+                now - 1000 + page,
+            )
+            for page in range(40)
+        ]
+        newest_url = "https://example.com/newest"
+        rows.append((newest_url, "Newest", "cachemarker newest content", now))
+        await conn.executemany(
+            "INSERT INTO pages(url, title, content, fetched) VALUES (?, ?, ?, ?)", rows,
+        )
+        await conn.commit()
+        assert len(await fresh_cache.search_pages("cachemarker", limit=100)) == 41
+        assert fresh_cache._db_size() > 1024 * 1024
+        monkeypatch.setattr(settings, "cache_max_mb", 1)
+        if expire_old:
+            monkeypatch.setattr(settings, "cache_ttl_seconds", 60)
+
+        await fresh_cache._maintain(conn)
+
+        assert fresh_cache._db_size() <= 1024 * 1024
+        async with conn.execute("SELECT url FROM pages ORDER BY fetched, rowid") as cur:
+            surviving = [row[0] for row in await cur.fetchall()]
+        assert surviving[-1:] == [newest_url]
+        if expire_old:
+            assert surviving == [newest_url]
+        else:
+            assert 1 < len(surviving) < 41
+            assert surviving == [row[0] for row in rows[-len(surviving):]]
+        # Check external-content consistency before search_pages can repair it.
+        await conn.execute("INSERT INTO pages_fts(pages_fts, rank) VALUES('integrity-check', 1)")
+        await conn.commit()
+        assert {hit["url"] for hit in await fresh_cache.search_pages("cachemarker", limit=100)} == set(surviving)
+
+        statements = []
+        await conn.set_trace_callback(statements.append)
+        await fresh_cache._maintain(conn)
+        assert not any(
+            "pages_fts" in statement.lower()
+            and any(command in statement.lower() for command in ("'merge'", "'optimize'"))
+            for statement in statements
+        )
+        assert await fresh_cache.get_page(newest_url) is not None
+    finally:
+        await fresh_cache.close()
+
+
+async def test_incremental_fts_merge_commits_and_closes_each_step():
+    from search_mcp.cache import Cache
+
+    operations = []
+
+    class Cursor:
+        def __init__(self, connection, pages):
+            self.connection = connection
+            self.pages = pages
+
+        async def __aenter__(self):
+            operations.append(("merge", self.pages))
+            self.connection.total_changes += next(self.connection.changes)
+            return self
+
+        async def __aexit__(self, *exc):
+            operations.append(("close", None))
+
+    class Connection:
+        total_changes = 0
+
+        def __init__(self):
+            self.changes = iter([3, 2, 1])
+
+        def execute(self, sql, parameters):
+            assert sql == "INSERT INTO pages_fts(pages_fts, rank) VALUES('merge', ?)"
+            return Cursor(self, parameters[0])
+
+        async def commit(self):
+            operations.append(("commit", None))
+
+    await Cache._compact_fts(Connection())
+    step = Cache._FTS_MERGE_PAGES
+    assert operations == [
+        ("merge", -step), ("close", None), ("commit", None),
+        ("merge", step), ("close", None), ("commit", None),
+        ("merge", step), ("close", None), ("commit", None),
+    ]
+
+
 async def test_maintain_disabled_when_cap_is_zero(fresh_cache, monkeypatch):
     from search_mcp.config import settings
 
@@ -245,16 +354,17 @@ async def test_writes_trigger_maintenance_on_cadence(fresh_cache, monkeypatch):
     async def _fake_maintain(conn):
         calls.append(1)
 
-    # _conn() runs one maintenance at init; silence it via the fake AFTER init.
     await fresh_cache._conn()
+    await fresh_cache._maintain_task
     monkeypatch.setattr(fresh_cache, "_maintain", _fake_maintain)
     monkeypatch.setattr(type(fresh_cache), "_MAINTAIN_EVERY", 5, raising=True)
 
     for i in range(12):
         await fresh_cache.put_page(f"https://example.com/c{i}", "t", "body")
-    # Maintenance is now fire-and-forget; let the scheduled tasks run.
-    await asyncio.sleep(0)
-    assert len(calls) == 2  # at write #5 and #10
+        if (i + 1) % 5 == 0:
+            await fresh_cache._maintain_task
+    assert len(calls) == 2
+    assert fresh_cache._writes_since_maintain == 2
     await fresh_cache.close()
 
 

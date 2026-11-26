@@ -23,7 +23,7 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-def isolated_cache(tmp_path, monkeypatch):
+async def isolated_cache(tmp_path, monkeypatch):
     """Point the singleton cache (and every module that imported it) at a tmp db."""
     from search_mcp import aggregator as agg_mod
     from search_mcp import cache as cache_mod
@@ -34,7 +34,10 @@ def isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(cache_mod, "cache", fresh)
     monkeypatch.setattr(agg_mod, "cache", fresh)
     monkeypatch.setattr(server_mod, "cache", fresh)
-    return fresh
+    try:
+        yield fresh
+    finally:
+        await fresh.close()
 
 
 class _FakeResult:

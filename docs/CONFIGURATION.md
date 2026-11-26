@@ -33,7 +33,7 @@ Available settings:
 | `SEARCH_MCP_FETCH_RATE_LIMIT_PER_MINUTE` | `20` | shared `fetch` bucket |
 | `SEARCH_MCP_CACHE_DIR` | `~/.cache/search-mcp` | |
 | `SEARCH_MCP_CACHE_TTL_SECONDS` | `604800` | 7 days. Searches that asked for recency expire sooner regardless: `freshness=day` 1h, `week` 6h, `month` 24h, `category=news` 6h |
-| `SEARCH_MCP_CACHE_MAX_MB` | `512` | size cap on the cache file; `0` disables |
+| `SEARCH_MCP_CACHE_MAX_MB` | `512` | best-effort size cap on the database and WAL; `0` disables size enforcement. Under live-data pressure, a separate maintenance connection reclaims FTS5 history in committed merge steps before evicting more rows. Readers holding snapshots can defer WAL truncation |
 | `SEARCH_MCP_FETCH_STRATEGY` | `auto` | `auto` / `http` / `browser` |
 | `SEARCH_MCP_BROWSER_HEADLESS` | `true` | |
 | `SEARCH_MCP_BROWSER_CHANNEL` | *(empty)* | empty launches the Chromium Playwright downloads. `chrome` or `msedge` launches the installed browser instead; on macOS that makes the system count the headless instance as your own Chrome, so with yours closed its Dock icon and links can land in a windowless browser |
