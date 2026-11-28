@@ -15,6 +15,7 @@ pub mod github;
 pub mod github_releases;
 mod instance_search;
 pub mod openmeteo;
+pub mod perplexity;
 pub mod rdap;
 pub mod registries;
 pub mod searxng;
@@ -50,5 +51,6 @@ pub fn register(reg: &mut Registry, deps: &SourceDeps) -> Result<(), FsmError> {
     reg.register(Arc::new(serper::SerperEngine::new(deps.clone())))?;
     reg.register(Arc::new(serpbase::SerpBaseEngine::new(deps.clone())))?;
     reg.register(Arc::new(tavily::TavilyEngine::new(deps.clone())))?;
+    reg.register(Arc::new(perplexity::PerplexityEngine::new(deps.clone())))?;
     Ok(())
 }
